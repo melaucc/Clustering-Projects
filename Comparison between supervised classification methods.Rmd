@@ -1,0 +1,1548 @@
+---
+title: "Comparison between supervised classification methods"
+author: "Carmela Uccello"
+date: "2026-01-06"
+output: html_document
+---
+## Library upload
+```{r, echo=FALSE}
+library(dplyr)
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(lubridate)
+library(readr)
+library(ggplot2)
+library(scales)
+library(purrr)
+library(ggcorrplot)
+library(tibble)
+library(caret)
+library(MASS)
+library(caret)
+library(glmnet)
+library(MixGHD)
+library(mixsmsn)
+library(cluster)
+library(factoextra)
+library(car)
+library(pROC)
+library(randomForest)
+library(xgboost)
+library(SHAPforxgboost)
+```
+
+## Data upload
+
+```{r}
+df <- readr::read_tsv("data/marketing_campaign.csv") %>%
+  janitor::clean_names()
+```
+
+Content
+
+AcceptedCmp1 - 1 if customer accepted the offer in the 1st campaign, 0 otherwise
+AcceptedCmp2 - 1 if customer accepted the offer in the 2nd campaign, 0 otherwise
+AcceptedCmp3 - 1 if customer accepted the offer in the 3rd campaign, 0 otherwise
+AcceptedCmp4 - 1 if customer accepted the offer in the 4th campaign, 0 otherwise
+AcceptedCmp5 - 1 if customer accepted the offer in the 5th campaign, 0 otherwise
+Response (target) - 1 if customer accepted the offer in the last campaign, 0 otherwise
+Complain - 1 if customer complained in the last 2 years
+DtCustomer - date of customer’s enrolment with the company
+Education - customer’s level of education
+Marital - customer’s marital status
+Kidhome - number of small children in customer’s household
+Teenhome - number of teenagers in customer’s household
+Income - customer’s yearly household income
+MntFishProducts - amount spent on fish products in the last 2 years
+MntMeatProducts - amount spent on meat products in the last 2 years
+MntFruits - amount spent on fruits products in the last 2 years
+MntSweetProducts - amount spent on sweet products in the last 2 years
+MntWines - amount spent on wine products in the last 2 years
+MntGoldProds - amount spent on gold products in the last 2 years
+NumDealsPurchases - number of purchases made with discount
+NumCatalogPurchases - number of purchases made using catalogue
+NumStorePurchases - number of purchases made directly in stores
+NumWebPurchases - number of purchases made through company’s web site
+NumWebVisitsMonth - number of visits to company’s web site in the last month
+Recency - number of days since the last purchase
+
+## Exploratory Data Analysis
+
+```{r}
+glimpse(df)
+dim(df)
+```
+Only the “Income” variable has zero values. Since there are only 24 missing values, it was decided to eliminate them directly. 
+
+```{r}
+skimr::skim(df)
+```
+
+
+```{r}
+df_clean <- df %>%
+  mutate(
+    across(c(
+      id, education, marital_status,
+      kidhome, teenhome,
+      accepted_cmp1, accepted_cmp2, accepted_cmp3,
+      accepted_cmp4, accepted_cmp5, response
+    ), as.factor)
+  )
+```
+
+
+```{r}
+df_clean <- df_clean %>% tidyr::drop_na(income)
+
+sum(is.na(df_clean))
+```
+
+The variables “z_cost_contact” and “z_revenue” have a constant value, as they do not add any information and are therefore eliminated from the analysis.
+
+```{r}
+df %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "n_unique") %>%
+  filter(n_unique == 1)
+```
+```{r}
+df_clean <- df %>% dplyr::select(-z_cost_contact, -z_revenue)
+```
+
+Two variables with almost zero variance were found and therefore eliminated.
+
+```{r}
+nzv <- nearZeroVar(df_clean, saveMetrics = TRUE)
+nzv[nzv$zeroVar | nzv$nzv, ]
+df_clean <- df_clean[, !nzv$zeroVar & !nzv$nzv]
+```
+
+The “Yolo,” “Absurd,” and ‘Alone’ modes of the “marital_status” variable have been removed, as they have a very low presence and distort the analysis.
+
+```{r}
+df_clean <- df_clean %>%
+  filter(!marital_status %in% c("YOLO", "Absurd")) %>%
+  mutate(marital_status = fct_recode(marital_status,
+    "Single" = "Alone" 
+  )) %>%
+  mutate(marital_status = droplevels(marital_status))
+
+df_clean <- df_clean %>%
+  mutate(
+    marital_status = fct_collapse(marital_status,
+      "Divorced_Widow" = c("Divorced", "Widow")
+    )
+  )
+
+count(df_clean, marital_status)
+
+
+```
+The variables relating to children and young people in households have been grouped together under a single variable, “Children.”
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(children = kidhome + teenhome) %>%
+  dplyr::select(-kidhome, -teenhome)
+```
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(
+    total_spent =
+      mnt_wines + mnt_fruits + mnt_meat_products +
+        mnt_fish_products + mnt_sweet_products +
+        mnt_gold_prods
+  )
+```
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(age = 2024 - year_birth) %>%
+  dplyr::select(-year_birth)
+```
+
+A logarithmic transformation was applied to the Income feature to correct for the strong positive asymmetry (right-skewness) typical of income distributions.
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(income_log = log(income)) %>%
+  dplyr::select(-income)
+
+
+df_clean <- df_clean %>%
+  na.omit(is.na(income_log))
+```
+
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(
+    accepted_any = if_else(rowSums(dplyr::select(., starts_with("Accepted"))) > 0, 1, 0),
+    accepted_any = as.factor(accepted_any)
+  )
+
+df_clean <- df_clean %>%
+  dplyr::select(-accepted_cmp1, -accepted_cmp3, -accepted_cmp4, -accepted_cmp5)
+
+table(df_clean$accepted_any)
+```
+
+
+```{r}
+dim(df_clean)
+```
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = factor(response))) +
+  geom_bar(fill = "#4E79A7", color = "white", alpha = 0.9, width = 0.6) +
+  scale_x_discrete(labels = c("0" = "No", "1" = "Yes")) +
+  labs(
+    title = "Distribution Response",
+    x = "Response",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = income_log)) +
+  geom_histogram(bins = 60, fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Income",
+    x = "Log Income",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+
+
+```{r}
+df_clean <- df_clean %>% filter(id != 9432)
+```
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = income_log)) +
+  geom_histogram(bins = 60, fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Log Income",
+    x = "Log Income",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = reorder(education, education, function(x) -length(x)))) +
+  geom_bar(fill = "#4682B4", color = "white", alpha = 0.8, width = 0.6) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, color = "#333333") +
+  labs(
+    title = "Level of Education",
+    x = "Educational Qualification",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+```
+
+total_spent is a variable created to show the total expenditure incurred by the various instances. Its marked asymmetry is due to the underlying asymmetry of the various variables that comprise it.
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = total_spent)) +
+  geom_histogram(bins = 40, fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Total Spent",
+    x = "Total Spent",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+```{r}
+df_clean %>%
+  ggplot(aes(x = factor(children))) +
+  geom_bar(fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Children",
+    x = "Children",
+    y = "Counts"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+As can be seen from the graphs, all the “mnt_” variables show strong asymmetry.
+
+```{r}
+colonne_mnt <- df_clean %>%
+  dplyr::select(starts_with("mnt")) %>%
+  names()
+
+lista_grafici <- map(colonne_mnt, function(col_name) {
+  ggplot(df_clean, aes(x = .data[[col_name]])) + 
+    geom_histogram(bins = 30, fill = "#4682B4", color = "white", alpha = 0.8) +
+    scale_x_continuous(
+      labels = label_dollar(prefix = "€ ", big.mark = ".", decimal.mark = ",")
+    ) +
+    labs(
+      title = paste("Distribution", col_name), 
+      x = "Amount spent",
+      y = "Frequency"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      panel.grid.minor = element_blank()
+    )
+})
+
+names(lista_grafici) <- colonne_mnt
+```
+
+```{r}
+walk(lista_grafici, print)
+```
+Recency is crucial for calculating the churn rate, indicating the number of days since the last purchase.
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = recency)) +
+  geom_histogram(binwidth = 5, fill = "#4682B4", color = "white", alpha = 0.8) +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(
+    title = "Distribution Recency",
+    subtitle = "Days since the customer's last purchase",
+    x = "Days since last purchase",
+    y = "Number of Customers"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10))
+  )
+```
+
+There is a strong correlation (0.64) between income and spending on wine (mnt_wines). 
+High income is positively linked to purchases in stores (0.63) and from catalogs (0.59).
+There is a strong negative correlation (-0.61) between income and visits to the website.
+The correlation (0.74) is between mnt_meat_products and num_catalog_purchases (those who buy a lot of meat tend to do so via catalog).
+Those who spend on fish also tend to spend on fruit (0.59), meat (0.57), and desserts (0.59).
+
+```{r}
+df_corr <- df_clean %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(-total_spent)%>%
+  dplyr::select(-matches("ID|id"))
+
+corr_matrix <- cor(df_corr, use = "complete.obs")
+
+ggcorrplot(corr_matrix,
+  method = "square",
+  type = "lower",
+  lab = FALSE,
+  colors = c("#B2182B", "white", "#E41A1C"),
+  title = "Correlation Matrix",
+  ggtheme = theme_minimal()
+) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+```{r}
+classifica_correlazioni <- as.data.frame(corr_matrix) %>%
+  
+  rownames_to_column(var = "Var1") %>%
+  pivot_longer(cols = -Var1, names_to = "Var2", values_to = "Correlazione") %>%
+  filter(Var1 < Var2) %>%
+  arrange(desc(abs(Correlazione)))
+
+print("Higher correlations")
+head(classifica_correlazioni, 10)
+```
+```{r}
+df_clean <- df_clean%>%
+  dplyr::select(-dt_customer)
+```
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(
+    education = fct_collapse(education,
+      "Undergrad_Grad" = c("Basic", "Graduation")
+    ))
+table(df_clean$education)
+
+```
+
+
+
+### Target
+
+Customers who tend to spend more are more likely to accept the latest campaign offer, regardless of the product category.
+
+```{r}
+df_clean %>%
+  dplyr::select(response, starts_with("mnt")) %>%
+  pivot_longer(cols = -response, names_to = "Product_Category", values_to = "Import") %>%
+  mutate(response = as.factor(response)) %>%
+  ggplot(aes(x = response, y = Import, fill = response)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  scale_y_log10(labels = label_dollar(prefix = "€", big.mark = ".", decimal.mark = ",")) +
+  facet_wrap(~Product_Category, scales = "free_y") +
+  scale_fill_manual(
+    values = c("0" = "#9575CD", "1" = "#F06292"),
+    labels = c("0" = "No", "1" = "Yes")
+  ) +
+  labs(
+    title = "Impact of Expenditure on Response",
+    x = "Did you accept the last offer?",
+    y = "Amount Spent (Log Scale)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+Those with more children tend not to respond, perhaps due to income or time constraints.
+Doctoral students are the best customers, while those with a basic education tend not to respond.
+The variable concerning marital status seems to show that married or cohabiting people are less likely to respond.
+
+```{r}
+plot_pct <- function(df, var_name, titolo) {
+  global_mean <- mean(as.numeric(as.character(df$response)), na.rm = TRUE)
+
+  df %>%
+    filter(!is.na(.data[[var_name]])) %>%
+    ggplot(aes(x = .data[[var_name]], fill = as.factor(response))) +
+    geom_bar(position = "fill", alpha = 0.9) +
+    geom_hline(
+      yintercept = global_mean,
+      color = "white", linetype = "dashed", linewidth = 1
+    ) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(
+      values = c("0" = "#9575CD", "1" = "#F06292"),
+      name = "Response",
+      labels = c("No", "Yes")
+    ) +
+    labs(
+      title = titolo,
+      y = "Percentage of Response",
+      x = ""
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    )
+}
+
+
+p1 <- plot_pct(df_clean, "education", "Response for Education Level")
+p2 <- plot_pct(df_clean, "marital_status", "Response for Marital Status")
+p3 <- plot_pct(df_clean, "children", "Response for Children")
+
+print(p1)
+print(p2)
+print(p3)
+```
+Customers who respond to the latest offer have a median number of days since their last purchase that is significantly lower than those who do not respond to the latest campaign.
+
+```{r}
+ggplot(df_clean, aes(x = as.factor(response), y = recency, fill = as.factor(response))) +
+  geom_boxplot(alpha = 0.8) +
+  scale_fill_manual(values = c("0" = "#9575CD", "1" = "#F06292")) +
+  scale_x_discrete(labels = c("0" = "No", "1" = "Yes")) +
+  labs(
+    title = "Recency vs Response",
+    x = "Response",
+    y = "Recency"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+As expected, total spending is higher among consumers who are more likely to accept advertising campaigns.
+```{r}
+df_clean %>%
+  ggplot(aes(x = factor(response), y = total_spent, fill = factor(response))) +
+  geom_boxplot(alpha = 0.8, outlier.colour = "#FF5555", outlier.size = 2) +
+  scale_fill_manual(values = c("violet", "blue")) +
+  labs(
+    title = "Total spent for Response",
+    x = "Response",
+    y = "Total Spent"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  )
+```
+
+## Logistic Regression
+
+```{r}
+df_logistic <- df_clean %>%
+  mutate(response = as.factor(response))
+
+set.seed(1926)
+
+idx <- caret::createDataPartition(
+  df_logistic$response,
+  p = 0.7,
+  list = FALSE
+)
+
+train <- df_logistic[idx, ]
+train <- train %>%
+  dplyr::select(-id)
+test <- df_logistic[-idx, ]
+
+test <- test%>%
+  dplyr::select((-id))
+```
+
+Weights for imbalanced class
+
+```{r}
+class_weights <- ifelse(
+  train$response == 1,
+  sum(train$response == 0) / nrow(train),
+  sum(train$response == 1) / nrow(train)
+)
+```
+Step wise on train set
+“The warning related to non-integer successes is expected due to the use of continuous class weights and does not affect model validity.”
+
+```{r}
+full_model <- suppressWarnings(glm(
+  response ~ age + education + marital_status + income_log +
+    children + recency + mnt_wines + mnt_fruits +
+    mnt_meat_products + mnt_fish_products + mnt_sweet_products +
+    mnt_gold_prods + num_deals_purchases + num_web_purchases +
+    num_catalog_purchases + num_store_purchases +
+    num_web_visits_month + accepted_any,
+  data = train,
+  family = binomial,
+  weights = class_weights
+))
+```
+
+```{r}
+null_model <- suppressWarnings(glm(
+  response ~ 1,
+  data = train,
+  family = binomial,
+  weights = class_weights
+))
+```
+
+
+```{r}
+best_model <- suppressWarnings(stepAIC(
+  null_model,
+  scope = list(lower = null_model, upper = full_model),
+  direction = "both",
+  trace = TRUE
+))
+```
+The strongest predictor is accepted_any1,if a customer has accepted offers in the past, they are much more likely to respond again.
+
+The level of education affects the probability of response (it increases as the level of education increases).
+Marital status also has an impact: single people are more likely to respond.
+Recencyas the number of days since the last purchase increases, the probability of response decreases. 
+
+The error made by the model is much lower than the error made by the model without variables, so it can be said that the variables are explaining the phenomenon well.
+
+```{r}
+best_model
+```
+
+```{r}
+prob_test <- predict(best_model, test, type = "response")
+```
+The most reliable variables appear to be accepted_any1, num_web_visits_month, recency, and the “Married” and “Together” modes of marital_status.
+```{r}
+suppressWarnings(exp(cbind(OR = coef(best_model), confint(best_model))))
+```
+num_catalog_purchases, mnt_meat_products, and num_web_visits_month: these have the highest values; people who buy a lot of meat often use the catalog and visit the website. Since they are below 5, the model can distinguish the impact of each.
+
+education and marital_status: these have values close to 1.0, meaning that education level and marital status are totally independent of spending habits in your dataset.
+
+```{r}
+vif(best_model)
+```
+
+```{r}
+roc_obj <- roc(
+  response = as.numeric(as.character(test$response)),
+  predictor = prob_test,
+  direction = "<"
+)
+
+auc_value <- auc(roc_obj)
+```
+If you take a random customer who responded and one who did not respond, the model has an 85.7% chance of assigning a higher score to the one who actually responded.
+The curve rises rapidly toward the upper left corner, indicating that you can achieve high sensitivity without sacrificing too much specificity (it does not confuse no responses).
+```{r}
+plot(
+  roc_obj,
+  col = "skyblue",
+  lwd = 2,
+  main = paste("ROC Curve - Logistic Model (AUC =", round(auc_value, 3), ")")
+)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+```
+
+```{r}
+opt <- coords(
+  roc_obj,
+  x = "best",
+  best.method = "youden",
+  ret = c("threshold", "sensitivity", "specificity")
+)
+
+opt
+```
+Classification with best threshold
+
+```{r}
+threshold <- opt["threshold"]
+threshold <- as.numeric(opt[1])
+```
+
+
+```{r}
+pred_class <- ifelse(prob_test >= threshold, 1, 0)
+pred_class <- factor(pred_class, levels = c(0, 1))
+```
+
+```{r}
+length(pred_class)
+length(test$response)
+```
+Specificity (true negatives) identifies 80% of those who will not respond.
+Sensitivity is 0.788, indicating that you can identify about 79% of interested customers.
+
+There are a total of 21 false negatives that would have responded yes, and the model tends to make the less serious error (115 false positives).
+
+Confusion Matrix
+
+```{r}
+cm <- confusionMatrix(
+  pred_class,
+  test$response,
+  positive = "1"
+)
+```
+
+```{r}
+cm_df <- as.data.frame(cm$table)
+colnames(cm_df) <- c("Predicted", "Actual", "Freq")
+
+ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#F7FBFF", high = "skyblue") +
+  labs(
+    title = "Confusion Matrix – Logistic Regression",
+    x = "Actual Class",
+    y = "Predicted Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+Metrics
+
+```{r}
+cm <- confusionMatrix(pred_class, test$response, positive = "1")
+
+precision <- cm$byClass["Precision"]
+recall <- cm$byClass["Recall"]
+f1 <- cm$byClass["F1"]
+specificity <- cm$byClass["Specificity"]
+balanced_acc <- cm$byClass["Balanced Accuracy"]
+
+metrics_logistic <- tibble::tibble(
+  Model = c("Logistica"),
+  AUC = as.numeric(auc_value),
+  Precision = as.numeric(cm$byClass["Precision"]),
+  Recall = as.numeric(cm$byClass["Recall"]),
+  F1 = as.numeric(cm$byClass["F1"]),
+  Specificity = as.numeric(cm$byClass["Specificity"]),
+  Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"])
+)
+
+metrics_logistic
+```
+## LASSO and RIDGE
+
+Class imbalance was addressed using weights calculated previously with logistics.
+Elements of the minority class are assigned a weight equal to the frequency of the majority class, and viceversa.
+This forces the models to engage in the same way for observations from both classes.
+
+```{r}
+cat_cols <- names(train)[sapply(train, function(x) is.factor(x) || is.character(x))]
+cat_cols <- setdiff(cat_cols, "response")
+
+for (col in cat_cols) {
+  train[[col]] <- as.factor(train[[col]])
+  test[[col]] <- factor(test[[col]], levels = levels(train[[col]]))
+}
+
+
+X_train <- model.matrix(response ~ ., data = train)[, -1]
+y_train <- train$response
+
+test_clean <- na.omit(test)
+X_test <- model.matrix(response ~ ., data = test_clean)[, -1]
+y_test <- test_clean$response
+
+
+X_train_scaled <- scale(X_train)
+
+train_means <- attr(X_train_scaled, "scaled:center")
+train_sds <- attr(X_train_scaled, "scaled:scale")
+
+X_test_scaled <- scale(X_test, center = train_means, scale = train_sds)
+
+X_train_scaled <- X_train_scaled[, colnames(X_train_scaled) != "id"]
+X_test_scaled <- X_test_scaled[, colnames(X_test_scaled) != "id"]
+```
+### Lasso
+
+```{r}
+set.seed(1926)
+lasso_model <- suppressWarnings(cv.glmnet(
+  x = X_train_scaled, 
+  y = y_train,   
+  family = "binomial",
+  alpha = 1,
+  weights = class_weights,  
+  type.measure = "auc",
+  standardize = FALSE       
+))
+
+prob_lasso <- predict(lasso_model, X_test_scaled, type = "response", s = "lambda.min")
+```
+
+The most predictive variables in this case are also accepted_Any1, num_web_visits_month, mnt_meat_products, and num_catalog_purchases.
+Recency, being in a relationship, and those who tend to go to the store respond less to the latest advertising campaign.
+
+A slight negative effect is also given by the type of education, the number of children, and age.
+
+```{r}
+lasso_coefs <- coef(lasso_model, s = "lambda.min")
+lasso_coefs_df <- as.data.frame(as.matrix(lasso_coefs))
+colnames(lasso_coefs_df) <- "Coefficiente"
+
+selected_features <- lasso_coefs_df[lasso_coefs_df$Coefficiente != 0, , drop = FALSE]
+print(selected_features)
+```
+
+
+### Ridge
+
+```{r}
+set.seed(1926)
+ridge_model <- suppressWarnings(cv.glmnet(
+  x = X_train_scaled, 
+  y = y_train,   
+  family = "binomial",
+  alpha = 0,
+  weights = class_weights,
+  type.measure = "auc",
+  standardize = FALSE       
+))
+
+prob_ridge <- predict(ridge_model, X_test_scaled, type = "response", s = "lambda.min")
+```
+
+```{r}
+ridge_coefs <- coef(ridge_model, s = "lambda.min")
+ridge_coefs_df <- as.data.frame(as.matrix(ridge_coefs))
+colnames(ridge_coefs_df) <- "Coefficiente"
+
+selected_features <- ridge_coefs_df[ridge_coefs_df$Coefficiente != 0, , drop = FALSE]
+print(selected_features)
+```
+The Ridge performs in the same way as the Lasso, which tends to bring the coefficients of the less influential variables to 0. But even though these variables are less influential, the fact that the two models perform in the same way allows us to say that they do not introduce noise.
+
+```{r}
+roc_lasso <- roc(y_test, as.numeric(prob_lasso))
+roc_ridge <- roc(y_test, as.numeric(prob_ridge))
+
+auc_lasso <- auc(roc_lasso)
+auc_ridge <- auc(roc_ridge)
+
+cat("AUC Lasso:", round(auc_lasso, 3), "\n")
+cat("AUC Ridge:", round(auc_ridge, 3), "\n")
+```
+
+
+```{r}
+roc_lasso_df <- data.frame(
+  False_Positive_Rate = 1 - roc_lasso$specificities,
+  True_Positive_Rate = roc_lasso$sensitivities,
+  Model = "Lasso"
+)
+
+roc_ridge_df <- data.frame(
+  False_Positive_Rate = 1 - roc_ridge$specificities,
+  True_Positive_Rate = roc_ridge$sensitivities,
+  Model = "Ridge"
+)
+
+roc_df <- rbind(roc_lasso_df, roc_ridge_df)
+ggplot(roc_df, aes(x = False_Positive_Rate, y = True_Positive_Rate, color = Model)) +
+  geom_line(size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curve - Lasso vs Ridge Regression",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("Lasso" = "blue", "Ridge" = "skyblue")) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r}
+opt_lasso <- coords(roc_lasso, x = "best", best.method = "youden", ret = c("threshold"))
+opt_ridge <- coords(roc_ridge, x = "best", best.method = "youden", ret = c("threshold"))
+
+threshold_lasso <- as.numeric(opt_lasso)
+threshold_ridge <- as.numeric(opt_ridge)
+```
+
+
+```{r}
+pred_lasso_class <- factor(ifelse(prob_lasso >= threshold_lasso, 1, 0), levels = c(0, 1))
+pred_ridge_class <- factor(ifelse(prob_ridge >= threshold_ridge, 1, 0), levels = c(0, 1))
+```
+
+
+```{r}
+cm_lasso <- confusionMatrix(pred_lasso_class, y_test, positive = "1")
+```
+
+
+```{r}
+cm_ridge <- confusionMatrix(pred_ridge_class, y_test, positive = "1")
+```
+
+```{r}
+plot_cm <- function(cm, title) {
+  cm_df <- as.data.frame(cm$table)
+  colnames(cm_df) <- c("Predicted", "Actual", "Freq")
+
+  ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 6) +
+    scale_fill_gradient(low = "#F7FBFF", high = "blue") +
+    labs(title = title, x = "Actual Class", y = "Predicted Class", fill = "Count") +
+    theme_minimal(base_size = 14)
+}
+```
+
+Both models have a higher number of false positives than false negatives.
+```{r}
+plot_cm(cm_lasso, "Confusion Matrix – Lasso")
+```
+
+
+```{r}
+plot_cm(cm_ridge, "Confusion Matrix – Ridge")
+```
+
+```{r}
+metrics_lasso_ridge <- tibble(
+  Model = c("Lasso", "Ridge"),
+  AUC = c(as.numeric(auc_lasso), as.numeric(auc_ridge)),
+  Precision = c(cm_lasso$byClass["Precision"], cm_ridge$byClass["Precision"]),
+  Recall = c(cm_lasso$byClass["Recall"], cm_ridge$byClass["Recall"]),
+  F1 = c(cm_lasso$byClass["F1"], cm_ridge$byClass["F1"]),
+  Specificity = c(cm_lasso$byClass["Specificity"], cm_ridge$byClass["Specificity"]),
+  Balanced_Accuracy = c(cm_lasso$byClass["Balanced Accuracy"], cm_ridge$byClass["Balanced Accuracy"])
+)
+
+metrics_lasso_ridge
+```
+
+```{r}
+coef_matrix <- coef(ridge_model, s = "lambda.min") %>% as.matrix()
+
+coef_df <- data.frame(
+  Feature = rownames(coef_matrix),
+  Coefficient = coef_matrix[, 1]
+)
+
+coef_df <- coef_df %>%
+  filter(Feature != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient)))
+
+
+top_20_features <- coef_df %>%
+  slice_max(order_by = abs(Coefficient), n = 20)
+
+
+ggplot(top_20_features, aes(x = reorder(Feature, Coefficient), y = Coefficient)) +
+  geom_col(aes(fill = Coefficient > 0)) +
+  coord_flip() +
+  labs(
+    title = "Top Predictors Ridge",
+    x = "Variables",
+    y = "Coefficients"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(
+    values = c("TRUE" = "blue", "FALSE" = "skyblue"),
+    labels = c("TRUE" = "Positivo", "FALSE" = "Negativo"),
+    name = "Influenza"
+  )
+```
+
+```{r}
+coef_lasso_matrix <- coef(lasso_model, s = "lambda.min") %>% as.matrix()
+
+lasso_df <- data.frame(
+  Feature = rownames(coef_lasso_matrix),
+  Coefficient = coef_lasso_matrix[, 1]
+)
+
+
+lasso_clean <- lasso_df %>%
+  filter(Feature != "(Intercept)") %>%
+  filter(Coefficient != 0) %>%
+  arrange(desc(abs(Coefficient)))
+
+cat("Il modello Lasso ha selezionato", nrow(lasso_clean), "variabili su", nrow(lasso_df) - 1, "\n")
+```
+
+```{r}
+plot_data <- lasso_clean %>%
+  slice_max(order_by = abs(Coefficient), n = 20)
+
+ggplot(plot_data, aes(x = reorder(Feature, Coefficient), y = Coefficient)) +
+  geom_col(aes(fill = Coefficient > 0)) +
+  coord_flip() +
+  labs(
+    title = "Top Predictors Lasso",
+    x = "Variables",
+    y = "Coefficients"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(
+    values = c("TRUE" = "blue", "FALSE" = "skyblue"),
+    labels = c("TRUE" = "Positivo", "FALSE" = "Negativo"),
+    name = "Influenza"
+  )
+```
+
+
+## GAM
+
+```{r}
+gam_formula <- as.formula(
+  response ~ s(age) + s(income_log) + s(recency) +
+    s(mnt_wines) + s(mnt_fruits) + s(mnt_meat_products) +
+    s(mnt_fish_products) + s(mnt_sweet_products) + s(mnt_gold_prods) +
+    education + marital_status + children +
+    num_deals_purchases + num_web_purchases + num_catalog_purchases +
+    num_store_purchases + num_web_visits_month + accepted_any
+)
+```
+
+
+```{r}
+test <- na.omit(test)
+library(mgcv)
+gam_model <- suppressWarnings(gam(
+  gam_formula, 
+  data = train, 
+  family = binomial,
+  weights = class_weights 
+))
+
+prob_gam <- predict(gam_model, test, type = "response")
+```
+Variables such as age, recency, mnt_fruits, mnt_fish_products, and mnt_sweet_products have an EDF of 1,000. Although the model has the freedom to fit curves, it has nevertheless chosen straight lines for these variables.
+The nonlinear relationships found concern income and meat products, which increase the probability of response up to a certain point.
+GOLD products also show a curvature, but it is not statistically significant (see p_value).
+```{r}
+plot(gam_model, pages = 1, shade = TRUE, seWithMean = TRUE)
+```
+```{r}
+summary(gam_model)
+```
+
+
+```{r}
+roc_gam <- roc(y_test, prob_gam)
+auc_gam <- auc(roc_gam)
+opt_gam <- coords(roc_gam, x = "best", best.method = "youden", ret = "threshold")
+threshold_gam <- as.numeric(opt_gam)
+```
+
+
+```{r}
+pred_gam_class <- factor(ifelse(prob_gam >= threshold_gam, 1, 0), levels = c(0, 1))
+```
+
+
+```{r}
+cm_gam <- confusionMatrix(pred_gam_class, y_test, positive = "1")
+```
+
+```{r}
+roc_gam_df <- data.frame(
+  False_Positive_Rate = 1 - roc_gam$specificities,
+  True_Positive_Rate = roc_gam$sensitivities
+)
+```
+
+
+```{r}
+roc_gam <- roc(y_test, as.numeric(prob_gam))
+auc_lasso <- auc(roc_gam)
+```
+
+The ROC curve appears more solid, with the same AUC area as previous models.
+```{r}
+ggplot(roc_gam_df, aes(x = False_Positive_Rate, y = True_Positive_Rate)) +
+  geom_line(color = "red", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curve - GAM",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+opt_gam <- coords(roc_gam, x = "best", best.method = "youden", ret = c("threshold"))
+threshold_gam <- as.numeric(opt_gam)
+```
+
+```{r}
+pred_gam_class <- factor(ifelse(prob_gam >= threshold_gam, 1, 0), levels = c(0, 1))
+cm_gam <- confusionMatrix(pred_gam_class, y_test, positive = "1")
+```
+The GAM model has succeeded in improving the ability to detect True Negatives compared to Ridge and Lasso, and is also better at identifying False Positives.
+
+```{r}
+cm_df <- as.data.frame(cm_gam$table)
+colnames(cm_df) <- c("Predicted", "Actual", "Freq")
+
+ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#D62728") +
+  labs(
+    title = "Confusion Matrix – GAM Logistic Regression",
+    x = "Actual Class",
+    y = "Predicted Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r}
+metrics_gam <- tibble(
+  Model = "GAM",
+  AUC = as.numeric(auc_gam),
+  Precision = cm_gam$byClass["Precision"],
+  Recall = cm_gam$byClass["Recall"],
+  F1 = cm_gam$byClass["F1"],
+  Specificity = cm_gam$byClass["Specificity"],
+  Balanced_Accuracy = cm_gam$byClass["Balanced Accuracy"]
+)
+
+print(metrics_gam)
+```
+s(recency) shows an almost perfect decline,each day of delay linearly “kills” the probability of success.
+
+```{r}
+gam_summary <- summary(gam_model)
+
+if (!is.null(gam_summary$s.table)) {
+  smooth_table <- as.data.frame(gam_summary$s.table)
+  stat_col_smooth <- grep("Chi\\.sq|F", colnames(smooth_table), value = TRUE)[1]
+
+  smooth_data <- data.frame(
+    Feature = rownames(smooth_table),
+    Statistic = smooth_table[[stat_col_smooth]],
+    Type = "Smooth"
+  )
+} else {
+  smooth_data <- data.frame()
+}
+
+p_table <- gam_summary$p.table
+
+if (!is.null(p_table) && nrow(p_table) > 0) {
+  p_df <- as.data.frame(p_table)
+  stat_col_linear <- grep("value", colnames(p_df), value = TRUE)[1]
+
+  stats_values <- if (!is.na(stat_col_linear)) p_df[[stat_col_linear]] else p_table[, 3]
+
+  linear_data <- data.frame(
+    Feature = rownames(p_df),
+    Statistic = stats_values^2,
+    Type = "Parametric (Linear)"
+  )
+
+  linear_data <- linear_data %>% filter(Feature != "(Intercept)")
+} else {
+  linear_data <- data.frame()
+}
+
+gam_importance <- bind_rows(smooth_data, linear_data)
+
+if (nrow(gam_importance) > 0) {
+  gam_importance <- gam_importance %>%
+    arrange(desc(Statistic)) %>%
+    slice_max(order_by = Statistic, n = 20)
+
+  ggplot(gam_importance, aes(x = reorder(Feature, Statistic), y = Statistic, fill = Type)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = "GAM",
+      subtitle = "Statistica del test (Chi-quadro approx)",
+      x = "Variables",
+      y = "Importance (Test Statistic)",
+      fill = "Tipo di Relazione"
+    ) +
+    theme_minimal() +
+    scale_fill_manual(values = c("Smooth" = "red", "Parametric (Linear)" = "blue"))
+} else {
+  print("Nessuna variabile significativa trovata o modello vuoto.")
+}
+```
+
+
+## Random Forest
+```{r}
+set.seed(1926)
+rf_model <- randomForest(
+  response ~ .,
+  data = train,
+  ntree = 500, 
+  mtry = floor(sqrt(ncol(train) - 1)),
+  importance = TRUE
+)
+
+prob_rf <- predict(rf_model, test, type = "prob")[, 2]
+```
+
+Random Forests has high levels of both specificity and sensitivity.
+```{r}
+roc_rf <- roc(y_test, prob_rf)
+auc_rf <- auc(roc_rf)
+cat("AUC Random Forest:", round(auc_rf, 3), "\n")
+
+roc_rf_df <- data.frame(
+  False_Positive_Rate = 1 - roc_rf$specificities,
+  True_Positive_Rate = roc_rf$sensitivities
+)
+
+ggplot(roc_rf_df, aes(x = False_Positive_Rate, y = True_Positive_Rate)) +
+  geom_line(color = "darkgreen", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curve - Random Forest",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r}
+opt_rf <- coords(roc_rf, x = "best", best.method = "youden", ret = c("threshold"))
+threshold_rf <- as.numeric(opt_rf)
+```
+
+
+```{r}
+pred_rf_class <- factor(ifelse(prob_rf >= threshold_rf, 1, 0), levels = c(0, 1))
+cm_rf <- confusionMatrix(pred_rf_class, y_test, positive = "1")
+```
+The model correctly identifies the vast majority of those who will not respond, reducing false positives to 94.
+It loses only 24 customers (false negatives).
+
+```{r}
+cm_rf_df <- as.data.frame(cm_rf$table)
+colnames(cm_rf_df) <- c("Predicted", "Actual", "Freq")
+
+ggplot(cm_rf_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#F7FBFF", high = "darkgreen") +
+  labs(
+    title = "Confusion Matrix – Random Forest",
+    x = "Actual Class",
+    y = "Predicted Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r}
+metrics_rf <- tibble(
+  Model = "Random Forest",
+  AUC = as.numeric(auc_rf),
+  Precision = cm_rf$byClass["Precision"],
+  Recall = cm_rf$byClass["Recall"],
+  F1 = cm_rf$byClass["F1"],
+  Specificity = cm_rf$byClass["Specificity"],
+  Balanced_Accuracy = cm_rf$byClass["Balanced Accuracy"]
+)
+
+print(metrics_rf)
+```
+Recency continues to be the best predictor, followed by income and total spent.
+```{r}
+imp_matrix <- importance(rf_model)
+
+rf_imp_df <- data.frame(
+  Feature = rownames(imp_matrix),
+  Importance = imp_matrix[, ncol(imp_matrix)]
+)
+
+rf_clean <- rf_imp_df %>%
+  arrange(desc(Importance)) %>%
+  slice_max(order_by = Importance, n = 20)
+
+ggplot(rf_clean, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance - Random Forest",
+    x = "Variables",
+    y = "Importance"
+  ) +
+  theme_minimal()
+```
+
+
+## XGBoost
+
+```{r}
+df_logistic <- df_logistic%>%
+  dplyr::select(-id)
+dummies <- caret::dummyVars(~., data = df_logistic %>% dplyr::select(-response))
+X_xgb_full <- predict(dummies, newdata = df_logistic)
+y_xgb_full <- as.numeric(df_logistic$response) - 1 
+
+X_train_xgb <- X_xgb_full[idx, ]
+y_train_xgb <- y_xgb_full[idx]
+X_test_xgb <- X_xgb_full[-idx, ]
+y_test_xgb <- y_xgb_full[-idx]
+
+dtrain <- xgb.DMatrix(data = X_train_xgb, label = y_train_xgb)
+dtest <- xgb.DMatrix(data = X_test_xgb, label = y_test_xgb)
+```
+
+```{r}
+set.seed(1926)
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.05,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+scale_pos_weight <- sum(y_train_xgb == 0) / sum(y_train_xgb == 1)
+params$scale_pos_weight <- scale_pos_weight
+
+xgb_model <- suppressWarnings(xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 500,
+  watchlist = list(train = dtrain, test = dtest),
+  print_every_n = 50,
+  early_stopping_rounds = 50,
+  verbose = 0
+))
+
+prob_xgb <- predict(xgb_model, dtest)
+```
+The ROC curve is closest to the upper left corner.
+```{r}
+roc_xgb <- roc(y_test, prob_xgb)
+auc_xgb <- auc(roc_xgb)
+cat("AUC XGBoost:", round(auc_xgb, 3), "\n")
+
+roc_xgb_df <- data.frame(
+  False_Positive_Rate = 1 - roc_xgb$specificities,
+  True_Positive_Rate = roc_xgb$sensitivities
+)
+
+ggplot(roc_xgb_df, aes(x = False_Positive_Rate, y = True_Positive_Rate)) +
+  geom_line(color = "blue", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curve - XGBoost",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+opt_xgb <- coords(roc_xgb, x = "best", best.method = "youden", ret = c("threshold"))
+threshold_xgb <- as.numeric(opt_xgb)
+```
+It identifies 83% of respondents (true positives) and has the lowest number of false negatives among the models tested.
+```{r}
+pred_xgb_class <- factor(ifelse(prob_xgb >= threshold_xgb, 1, 0), levels = c(0, 1))
+cm_xgb <- confusionMatrix(pred_xgb_class, y_test, positive = "1")
+```
+
+```{r}
+cm_xgb_df <- as.data.frame(cm_xgb$table)
+colnames(cm_xgb_df) <- c("Predicted", "Actual", "Freq")
+
+ggplot(cm_xgb_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#F7FBFF", high = "blue") +
+  labs(
+    title = "Confusion Matrix – XGBoost",
+    x = "Actual Class",
+    y = "Predicted Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+metrics_xgb <- tibble(
+  Model = "XGBoost",
+  AUC = as.numeric(auc_xgb),
+  Precision = cm_xgb$byClass["Precision"],
+  Recall = cm_xgb$byClass["Recall"],
+  F1 = cm_xgb$byClass["F1"],
+  Specificity = cm_xgb$byClass["Specificity"],
+  Balanced_Accuracy = cm_xgb$byClass["Balanced Accuracy"]
+)
+
+print(metrics_xgb)
+```
+XGBoost ranks variables based on Gain (the incremental contribution of each variable to the improvement of the model).
+It confirmed that Meat and Wines, together with Recency, are the “golden triangle” for predicting your customers' behavior.
+```{r}
+importance_matrix <- xgb.importance(model = xgb_model)
+
+plot_data <- importance_matrix %>%
+  as.data.frame() %>%
+  top_n(20, wt = Gain) %>%  
+  mutate(Feature = reorder(Feature, Gain))
+
+ggplot(plot_data, aes(x = Feature, y = Gain, fill = Gain)) +
+  geom_col(show.legend = FALSE) +               
+  coord_flip() +                                
+  scale_fill_viridis_c(option = "magma") +      
+  geom_text(aes(label = round(Gain, 3)),       
+            hjust = -0.2, size = 3.5, color = "black") + 
+  theme_minimal() +                            
+  labs(
+    title = "Feature Importance (XGBoost)",
+    x = NULL,                                   
+    y = "Importance (Gain)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text.y = element_text(size = 11, face = "bold")
+  )
+```
+
+## Robustness Check: 5-Fold Cross Validation
+
+In order to test the robustness and generalization ability of the models used, the data is split into 5 folds and the models are trained. 
+
+XGBoost has the highest average AUC, but Random Forest is more consistent because it has a lower standard deviation (it performs more or less the same across the 5 folds).
+Logistics has a very similar average to XGBoost.
+```{r}
+set.seed(1926)
+k <- 5
+folds <- sample(rep(1:k, length.out = nrow(train)))
+
+cv_results <- data.frame(Model = character(), Fold = integer(), AUC = numeric())
+
+for (i in 1:k) {
+  test_idx <- which(folds == i)
+  cv_train <- train[-test_idx, ]
+  cv_test <- train[test_idx, ]
+  
+  w_pos <- sum(cv_train$response == 0) / nrow(cv_train)
+  w_neg <- sum(cv_train$response == 1) / nrow(cv_train)
+  cv_weights <- ifelse(cv_train$response == 1, w_pos, w_neg)
+
+  m_log <- suppressWarnings(glm(response ~ ., data = cv_train, family = binomial, weights = cv_weights))
+  p_log <- predict(m_log, cv_test, type = "response")
+  auc_log <- auc(roc(cv_test$response, p_log, quiet = TRUE))
+
+  m_rf <- suppressWarnings(randomForest(response ~ ., data = cv_train, ntree = 100))
+  p_rf <- predict(m_rf, cv_test, type = "prob")[, 2]
+  auc_rf <- auc(roc(cv_test$response, p_rf, quiet = TRUE))
+
+  dummies_cv <- caret::dummyVars(~., data = cv_train %>% dplyr::select(-response))
+
+  X_cv_train <- predict(dummies_cv, newdata = cv_train)
+  y_cv_train <- as.numeric(cv_train$response) - 1
+  dtrain_fold <- xgb.DMatrix(data = X_cv_train, label = y_cv_train)
+
+  X_cv_test <- predict(dummies_cv, newdata = cv_test)
+  y_cv_test <- as.numeric(cv_test$response) - 1
+  dtest_fold <- xgb.DMatrix(data = X_cv_test, label = y_cv_test)
+
+  scale_pos <- sum(y_cv_train == 0) / sum(y_cv_train == 1)
+  params_cv <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = 0.1,
+    max_depth = 4, 
+    scale_pos_weight = scale_pos
+  )
+
+  m_xgb <- suppressWarnings(xgb.train(params = params_cv, data = dtrain_fold, nrounds = 100, verbose = 0))
+  p_xgb <- predict(m_xgb, dtest_fold)
+  auc_xgb <- auc(roc(cv_test$response, p_xgb, quiet = TRUE))
+
+  cv_results <- rbind(
+    cv_results,
+    data.frame(Model = "Logistic", Fold = i, AUC = as.numeric(auc_log)),
+    data.frame(Model = "Random Forest", Fold = i, AUC = as.numeric(auc_rf)),
+    data.frame(Model = "XGBoost", Fold = i, AUC = as.numeric(auc_xgb))
+  )
+}
+
+cv_summary <- cv_results %>%
+  group_by(Model) %>%
+  summarise(
+    Mean_AUC = mean(AUC),
+    SD_AUC = sd(AUC),
+    Min_AUC = min(AUC),
+    Max_AUC = max(AUC)
+  )
+
+print(cv_summary)
+```
+
+## Comparison between models
+
+XGBoost is the best performing model in terms of pure predictive power, while GAM and Random Forest offer the best balance between accuracy and the ability to correctly identify “no” responses.
+If the goal is to avoid losing any potential customers at all costs, Lasso would be the best choice (recall).
+GAM is the most conservative and balanced model with the highest precision and F1 score.
+
+All models converge on the same theory, with Recency, Accepted Any, and Meat Products driving the situation.
+
+```{r}
+metrics_logistic <- metrics_logistic %>% mutate(Model = "Stepwise Logistic")
+metrics_lasso_ridge <- metrics_lasso_ridge %>% mutate(Model = c("Lasso", "Ridge"))
+metrics_rf <- metrics_rf %>% mutate(Model = "Random Forest")
+metrics_gam <- metrics_gam %>% mutate(Model = "GAM")
+metrics_xgb <- metrics_xgb %>% mutate(Model = "XGBoost") 
+
+
+all_metrics_sorted <- bind_rows(
+  metrics_logistic,
+  metrics_lasso_ridge,
+  metrics_rf,
+  metrics_gam,
+  metrics_xgb
+) %>%
+  dplyr::select(Model, everything()) %>%
+  arrange(desc(AUC))                
+
+
+all_metrics_final <- as.data.frame(all_metrics_sorted)
+rownames(all_metrics_final) <- NULL  
+
+print(all_metrics_final)
+```
+## Shap Values for XGBoost
+
+The predictive powers of the Recency and Accepted_any variables and meat products are confirmed.
+
+```{r}
+shap_long <- shap.prep(xgb_model = xgb_model, X_train = X_test_xgb)
+shap.plot.summary(shap_long) +
+  ggtitle("SHAP Summary Plot") +
+  theme_minimal()
+```
+The red curve shows an almost perfect decline. Below 25 days of Recency, the impact is strongly positive (SHAP > 1). Above 50 days, the impact becomes consistently negative. The color of the dots indicates spending on meat.
+```{r}
+shap.plot.dependence(data_long = shap_long, x = "recency",
+                     color_feature = "auto") +
+  ggtitle("SHAP Dependence: Recency")
+```
+The curve reaches a plateau around €1,000 and then begins a slight downward parabola.
+```{r}
+shap.plot.dependence(data_long = shap_long, x = "mnt_meat_products",
+                     color_feature = "auto") +
+  ggtitle("SHAP Dependence: Meat Products")
+```

@@ -1,0 +1,891 @@
+---
+title: "Non Gaussian data - Unsupervised Clustering"
+author: "Carmela Uccello"
+date: "2026-01-06"
+output: html_document
+---
+## Library upload
+```{r,echo=FALSE}
+library(dplyr)
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(lubridate)
+library(readr)
+library(ggplot2)
+library(scales)
+library(purrr)
+library(ggcorrplot)
+library(tibble)
+library(caret)
+library(MASS)
+library(caret)
+library(glmnet)
+library(MixGHD)
+library(mixsmsn)
+library(cluster)
+library(factoextra)
+```
+
+## Data upload
+
+```{r}
+df <- readr::read_tsv("data/marketing_campaign.csv") %>%
+  janitor::clean_names()
+```
+
+Content
+
+AcceptedCmp1 - 1 if customer accepted the offer in the 1st campaign, 0 otherwise
+AcceptedCmp2 - 1 if customer accepted the offer in the 2nd campaign, 0 otherwise
+AcceptedCmp3 - 1 if customer accepted the offer in the 3rd campaign, 0 otherwise
+AcceptedCmp4 - 1 if customer accepted the offer in the 4th campaign, 0 otherwise
+AcceptedCmp5 - 1 if customer accepted the offer in the 5th campaign, 0 otherwise
+Response (target) - 1 if customer accepted the offer in the last campaign, 0 otherwise
+Complain - 1 if customer complained in the last 2 years
+DtCustomer - date of customer’s enrolment with the company
+Education - customer’s level of education
+Marital - customer’s marital status
+Kidhome - number of small children in customer’s household
+Teenhome - number of teenagers in customer’s household
+Income - customer’s yearly household income
+MntFishProducts - amount spent on fish products in the last 2 years
+MntMeatProducts - amount spent on meat products in the last 2 years
+MntFruits - amount spent on fruits products in the last 2 years
+MntSweetProducts - amount spent on sweet products in the last 2 years
+MntWines - amount spent on wine products in the last 2 years
+MntGoldProds - amount spent on gold products in the last 2 years
+NumDealsPurchases - number of purchases made with discount
+NumCatalogPurchases - number of purchases made using catalogue
+NumStorePurchases - number of purchases made directly in stores
+NumWebPurchases - number of purchases made through company’s web site
+NumWebVisitsMonth - number of visits to company’s web site in the last month
+Recency - number of days since the last purchase
+
+## Exploratory Data Analysis
+
+```{r}
+glimpse(df)
+dim(df)
+```
+Only the “Income” variable has zero values. Since there are only 24 missing values, it was decided to eliminate them directly. 
+
+```{r}
+skimr::skim(df)
+```
+
+
+```{r}
+df_clean <- df %>%
+  mutate(
+    across(c(
+      id, education, marital_status,
+      kidhome, teenhome,
+      accepted_cmp1, accepted_cmp2, accepted_cmp3,
+      accepted_cmp4, accepted_cmp5, response
+    ), as.factor)
+  )
+```
+
+
+```{r}
+df_clean <- df_clean %>% tidyr::drop_na(income)
+
+sum(is.na(df_clean))
+```
+
+The variables “z_cost_contact” and “z_revenue” have a constant value, as they do not add any information and are therefore eliminated from the analysis.
+
+```{r}
+df %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "n_unique") %>%
+  filter(n_unique == 1)
+```
+```{r}
+df_clean <- df %>% dplyr::select(-z_cost_contact, -z_revenue)
+```
+
+Two variables with almost zero variance were found and therefore eliminated.
+
+```{r}
+nzv <- nearZeroVar(df_clean, saveMetrics = TRUE)
+nzv[nzv$zeroVar | nzv$nzv, ]
+df_clean <- df_clean[, !nzv$zeroVar & !nzv$nzv]
+```
+
+The “Yolo,” “Absurd,” and ‘Alone’ modes of the “marital_status” variable have been removed, as they have a very low presence and distort the analysis.
+
+```{r}
+df_clean <- df_clean %>%
+  filter(!marital_status %in% c("YOLO", "Absurd")) %>%
+  mutate(marital_status = fct_recode(marital_status,
+    "Single" = "Alone" 
+  )) %>%
+  mutate(marital_status = droplevels(marital_status))
+
+count(df_clean, marital_status)
+```
+The variables relating to children and young people in households have been grouped together under a single variable, “Children.”
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(children = kidhome + teenhome) %>%
+  dplyr::select(-kidhome, -teenhome)
+```
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(
+    total_spent =
+      mnt_wines + mnt_fruits + mnt_meat_products +
+        mnt_fish_products + mnt_sweet_products +
+        mnt_gold_prods
+  )
+```
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(age = 2024 - year_birth) %>%
+  dplyr::select(-year_birth)
+```
+
+A logarithmic transformation was applied to the Income feature to correct for the strong positive asymmetry (right-skewness) typical of income distributions.
+
+```{r}
+df_clean <- df_clean %>%
+  mutate(income_log = log(income)) %>%
+  dplyr::select(-income)
+
+
+df_clean <- df_clean %>%
+  na.omit(is.na(income_log))
+```
+
+```{r}
+dim(df_clean)
+```
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = factor(response))) +
+  geom_bar(fill = "#4E79A7", color = "white", alpha = 0.9, width = 0.6) +
+  scale_x_discrete(labels = c("0" = "No", "1" = "Yes")) +
+  labs(
+    title = "Distribution Response",
+    x = "Response",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = income_log)) +
+  geom_histogram(bins = 60, fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Income",
+    x = "Log Income",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+
+
+```{r}
+df_clean <- df_clean %>% filter(id != 9432)
+```
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = income_log)) +
+  geom_histogram(bins = 60, fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Log Income",
+    x = "Log Income",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = reorder(education, education, function(x) -length(x)))) +
+  geom_bar(fill = "#4682B4", color = "white", alpha = 0.8, width = 0.6) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, color = "#333333") +
+  labs(
+    title = "Level of Education",
+    x = "Educational Qualification",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+```
+
+total_spent is a variable created to show the total expenditure incurred by the various instances. Its marked asymmetry is due to the underlying asymmetry of the various variables that comprise it.
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = total_spent)) +
+  geom_histogram(bins = 40, fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Total Spent",
+    x = "Total Spent",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+```{r}
+df_clean %>%
+  ggplot(aes(x = factor(children))) +
+  geom_bar(fill = "#4682B4", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution Children",
+    x = "Children",
+    y = "Counts"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+As can be seen from the graphs, all the “mnt_” variables show strong asymmetry.
+
+```{r}
+colonne_mnt <- df_clean %>%
+  dplyr::select(starts_with("mnt")) %>%
+  names()
+
+lista_grafici <- map(colonne_mnt, function(col_name) {
+  ggplot(df_clean, aes(x = .data[[col_name]])) + 
+    geom_histogram(bins = 30, fill = "#4682B4", color = "white", alpha = 0.8) +
+    scale_x_continuous(
+      labels = label_dollar(prefix = "€ ", big.mark = ".", decimal.mark = ",")
+    ) +
+    labs(
+      title = paste("Distribution", col_name), 
+      x = "Amount spent",
+      y = "Frequency"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      panel.grid.minor = element_blank()
+    )
+})
+
+names(lista_grafici) <- colonne_mnt
+```
+
+```{r}
+walk(lista_grafici, print)
+```
+Recency is crucial for calculating the churn rate, indicating the number of days since the last purchase.
+
+```{r}
+df_clean %>%
+  ggplot(aes(x = recency)) +
+  geom_histogram(binwidth = 5, fill = "#4682B4", color = "white", alpha = 0.8) +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(
+    title = "Distribution Recency",
+    subtitle = "Days since the customer's last purchase",
+    x = "Days since last purchase",
+    y = "Number of Customers"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#333333"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(margin = ggplot2::margin(r = 10))
+  )
+```
+
+There is a strong correlation (0.64) between income and spending on wine (mnt_wines). 
+High income is positively linked to purchases in stores (0.63) and from catalogs (0.59).
+There is a strong negative correlation (-0.61) between income and visits to the website.
+The correlation (0.74) is between mnt_meat_products and num_catalog_purchases (those who buy a lot of meat tend to do so via catalog).
+Those who spend on fish also tend to spend on fruit (0.59), meat (0.57), and desserts (0.59).
+
+```{r}
+df_corr <- df_clean %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(-total_spent)%>%
+  dplyr::select(-matches("ID|id"))
+
+corr_matrix <- cor(df_corr, use = "complete.obs")
+
+ggcorrplot(corr_matrix,
+  method = "square",
+  type = "lower",
+  lab = FALSE,
+  colors = c("#B2182B", "white", "#E41A1C"),
+  title = "Correlation Matrix",
+  ggtheme = theme_minimal()
+) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+```{r}
+classifica_correlazioni <- as.data.frame(corr_matrix) %>%
+  
+  rownames_to_column(var = "Var1") %>%
+  pivot_longer(cols = -Var1, names_to = "Var2", values_to = "Correlazione") %>%
+  filter(Var1 < Var2) %>%
+  arrange(desc(abs(Correlazione)))
+
+print("Higher correlations")
+head(classifica_correlazioni, 10)
+```
+```{r}
+df_clean <- df_clean%>%
+  dplyr::select(-dt_customer)
+```
+
+
+## Models for Non Gaussian Data
+Mixture of Generalized Hyperbolic Distributions (MixGHD)
+
+```{r}
+vars_clustering <- c("mnt_wines", "mnt_fruits", "mnt_meat_products", 
+                     "mnt_fish_products", "mnt_sweet_products", "mnt_gold_prods")
+
+X <- df_clean %>%
+  dplyr::select(all_of(vars_clustering)) %>%
+  scale()
+
+```
+
+
+```{r}
+set.seed(1926)
+mod_mghd <- MGHD(data = X, G = 2:5, modelSel = "BIC", scale = FALSE)  #sceglie tra 2 e 5 cluster
+df_clean$cluster <- factor(mod_mghd@map)
+
+summary(mod_mghd)
+plot(mod_mghd)
+
+```
+
+
+```{r}
+pca_res <- prcomp(X, scale. = TRUE)
+
+num_cluster <- length(unique(mod_mghd@map))
+
+df_plot <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  Cluster = factor(mod_mghd@map) 
+)
+
+ggplot(df_plot, aes(x = PC1, y = PC2, color = Cluster, fill = Cluster)) +
+  geom_point(alpha = 0.6, size = 2) +             
+  stat_ellipse(geom = "polygon", alpha = 0.2, level = 0.95) + 
+  scale_color_brewer(palette = "Set1") +          
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Clustering MGHD",
+    subtitle = paste("Cluster:", num_cluster), 
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100, 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+```{r}
+profile <- df_clean %>%
+  group_by(cluster) %>%
+  summarise(
+    Num_Consumer = n(),
+    Avg_Wines = mean(mnt_wines),
+    Avg_Meat = mean(mnt_meat_products),
+    Avg_Gold = mean(mnt_gold_prods),
+    Avg_Income = exp(mean(income_log)), 
+    Avg_Age = mean(age),
+    Avg_web = mean(num_web_visits_month),
+    Avg_purchases = mean(num_deals_purchases),
+    Avg_tot_spent=mean(total_spent)
+  ) %>%
+  arrange(desc(Avg_tot_spent))
+
+profile
+```
+```{r}
+df_clean$Segmento <- factor(df_clean$cluster, 
+                            levels = c("4", "1", "3", "2"), 
+                            labels = c("Premium", 
+                                       "High Potential", 
+                                       "Value Seekers", 
+                                       "Budget/Low Income"))
+
+
+table(df_clean$Segmento)
+```
+
+```{r}
+ggplot(df_clean, aes(x = Segmento, y = total_spent, fill = Segmento)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  
+  scale_y_continuous(labels = scales::dollar_format()) +
+  
+  # coord_cartesian taglia solo la visualizzazione, non i dati
+  coord_cartesian(ylim = c(0, 2500)) + 
+  
+  theme_minimal() +
+  labs(title = "Type of Consumer for Total Spent",
+       x = "Type of Consumer",
+       y = "Total Spent") +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(df_clean, aes(x = Segmento, y = income_log, fill = Segmento)) +
+  # Uso geom_boxplot invece di geom_density
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  
+  scale_y_continuous() +
+  theme_minimal() +
+  labs(title = "Type of Consumer for Total Spent",
+       x = "Type of Consumer",
+       y = "Income_log") +
+  theme(legend.position = "none")
+```
+
+For 50% of the data, the uncertainty is less than 0.8% (median value), while the average is much higher, so there are few observations that have a lot of uncertainty (asymmetric distribution).
+
+```{r}
+n_obs <- length(mod_mghd@map)
+n_clusters <- 4            
+
+z_matrix <- matrix(mod_mghd@z, nrow = n_obs, ncol = n_clusters)
+
+uncertainty <- 1 - apply(z_matrix, 1, max)
+
+summary(uncertainty)
+```
+The categories overlap and are not clearly distinct.
+```{r}
+df_plot_unc <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  Cluster = factor(mod_mghd@map),
+  Uncertainty = uncertainty
+)
+
+
+df_plot_unc <- df_plot_unc[order(df_plot_unc$Uncertainty), ]
+
+
+ggplot(df_plot_unc, aes(x = PC1, y = PC2, color = Uncertainty)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  labs(
+    title = "Classification Uncertainty Map",
+    color = "Incertezza"
+  )
+```
+
+Those belonging to cluster 4 purchase most of the food basket, but are not the leading purchasers of wine.
+Those belonging to cluster 1 are the leading consumers of wine, and favor meat and fish, neglecting everything else.
+Those belonging to cluster 2 all have negative values and are the opposite class to Premium (cluster 4).
+Finally, those belonging to cluster 3 are below average for meat, fruit, and fish but above average for wine and gold products.
+
+
+```{r}
+df_final <- as.data.frame(X)
+df_final$Cluster <- factor(mod_mghd@map)
+
+cluster_profile <- df_final %>%
+  group_by(Cluster) %>%
+  summarise(across(everything(), mean)) %>%
+  pivot_longer(-Cluster, names_to = "Variabile", values_to = "Media") %>%
+  pivot_wider(names_from = Cluster, values_from = Media, names_prefix = "Cluster_") %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+print(as.data.frame(cluster_profile))
+```
+```{r}
+profile_mghd <- df_clean%>%
+  group_by(Segmento)%>%
+  summarise(
+    Count = n(),
+    Avg_Wines = mean(mnt_wines),
+    Avg_Meat = mean(mnt_meat_products),
+    Avg_Gold = mean(mnt_gold_prods),
+    Avg_Fish = mean(mnt_fish_products),
+    Avg_Income = exp(mean(income_log)), 
+    Avg_Age = mean(age),
+    Avg_web = mean(num_web_visits_month),
+    Avg_purchases = mean(num_deals_purchases),
+    Avg_tot_spent=mean(total_spent)
+  ) %>%
+  arrange(desc(Avg_tot_spent))
+
+print(profile_mghd)
+```
+
+
+
+```{r}
+df_full <- as.data.frame(X)
+df_full$Cluster <- factor(mod_mghd@map)
+df_full$Uncertainty <- uncertainty
+
+df_clean_cc <- df_full[df_full$Uncertainty < 0.2, ]
+
+cat("Distribution of Cluster after filtering:\n")
+print(table(df_clean_cc$Cluster))
+
+cluster_means <- df_clean_cc %>%
+  group_by(Cluster) %>%
+  summarise(across(where(is.numeric), mean)) %>%
+  dplyr::select(-Uncertainty) %>%
+  pivot_longer(-Cluster, names_to = "Variabile", values_to = "Media") %>%
+  pivot_wider(names_from = Cluster, values_from = Media, names_prefix = "Cluster_") %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+print(as.data.frame(cluster_means))
+```
+The cluster that generates the most uncertainty is cluster 1, i.e., those who purchase the most wine.
+
+```{r}
+check_uncertainty <- df_full %>%
+  group_by(Cluster) %>%
+  summarise(
+    Incertezza_Media = mean(Uncertainty),
+    Incertezza_Max = max(Uncertainty),
+    Casi_Critici = sum(Uncertainty > 0.2),
+    Totale_Casi = n()
+  ) %>%
+  mutate(Perc_Critici = round(Casi_Critici / Totale_Casi * 100, 1))
+
+print(check_uncertainty)
+```
+```{r}
+ggplot(df_full, aes(x = Cluster, y = Uncertainty, fill = Cluster)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 0.2, linetype = "dashed", color = "red", size = 1) +
+  labs(
+    title = "Distribution of Uncertainty",
+    y = "Uncertainty (!-Probability)"
+  ) +
+  theme_minimal()
+```
+Cluster 1 tends to overlap with cluster 4. Wine consumers share with premium consumers a high consumption of meat. However, in cluster 1, the rest of the products are not consumed in large quantities, so when one of these consumers buys a little more fruit (for example), they begin to resemble a premium customer.
+
+```{r}
+z_matrix <- matrix(mod_mghd@z, nrow = nrow(X), ncol = 4)
+
+idx_incerti_c1 <- which(mod_mghd@map == 1 & (1 - apply(z_matrix, 1, max)) > 0.2)
+
+second_best <- apply(z_matrix[idx_incerti_c1, ], 1, function(row) {
+  order(row, decreasing = TRUE)[2]
+})
+
+
+table(second_best)
+```
+The graph confirms that there are heavy wine drinkers in both clusters. “Is it a Wine Lover who made a big purchase today? Or is it a Premium who bought less than usual?”
+```{r}
+# La variabile other_expenses considera tutti gli acquisti tranne quelli del vino
+df_comparison <- as.data.frame(X) %>%
+  mutate(
+    Cluster = factor(mod_mghd@map),
+    Uncertainty = uncertainty,
+    Other_Expenses = mnt_fruits + mnt_meat_products + mnt_fish_products + mnt_sweet_products + mnt_gold_prods
+  ) %>%
+  filter(Cluster %in% c("1", "4"))
+
+
+ggplot(df_comparison, aes(x = mnt_wines, y = Other_Expenses, color = Cluster)) +
+  geom_point(data = subset(df_comparison, Uncertainty < 0.2), 
+             alpha = 0.4, size = 1.5) +
+  geom_point(data = subset(df_comparison, Uncertainty >= 0.2), 
+             aes(shape = "Incerto"), size = 3, alpha = 0.8, stroke = 1.2) +
+  
+  scale_color_manual(values = c("1" = "red", "4" = "blue")) +
+  labs(
+    title = "Wine Lovers (1) vs Premium (4)",
+    x = "Wine (std)",
+    y = "Other Expenses (std)",
+    shape = "Stato"
+  ) +
+  theme_minimal()
+#i punti più grandi sono quelli che il clustering confonde
+```
+
+## Teigen
+
+The clusters have free shape, volume, and orientation. The number of degrees of freedom is the same for all clusters.
+```{r}
+library(teigen)
+
+set.seed(1926)
+X_mat <- as.matrix(X)
+
+#l'algoritmo sceglie liberamente il modello da utilizzare
+mod_teigen <- teigen(X_mat, Gs = 2:6, verbose = FALSE)
+
+(mod_teigen$modelname)
+(mod_teigen$G)
+
+summary(mod_teigen)
+```
+
+```{r}
+if (is.null(mod_teigen$map)) {
+  cluster_teigen <- factor(apply(mod_teigen$fuzzy, 1, which.max))
+} else {
+  cluster_teigen <- factor(mod_teigen$map)
+}
+print(length(cluster_teigen))
+```
+
+
+```{r}
+df_plot_teigen <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  Cluster = cluster_teigen
+)
+
+ggplot(df_plot_teigen, aes(x = PC1, y = PC2, color = Cluster, fill = Cluster)) +
+  geom_point(alpha = 0.6, size = 2) +
+  stat_ellipse(geom = "polygon", alpha = 0.2, level = 0.95) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Clustering Teigen (Modello: UUUC)",
+    subtitle = "T-test with constant heavy tails",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+df_clean$Cluster_Teigen <- cluster_teigen
+
+profile_teigen <- df_clean %>%
+  group_by(Cluster_Teigen) %>%
+  summarise(
+    Count = n(),
+    Avg_Wines = mean(mnt_wines),
+    Avg_Meat = mean(mnt_meat_products),
+    Avg_Gold = mean(mnt_gold_prods),
+    Avg_Fish = mean(mnt_fish_products),
+    Avg_Income = exp(mean(income_log)), 
+    Avg_Age = mean(age),
+    Avg_web = mean(num_web_visits_month),
+    Avg_purchases = mean(num_deals_purchases),
+    Avg_tot_spent=mean(total_spent)
+  ) %>%
+  arrange(desc(Avg_tot_spent))
+
+print(profile_teigen)
+```
+
+Further discrimination is again made against heavy wine drinkers.
+The two new clusters concern consumers who only buy wine and those who essentially only buy wine and meat.
+
+```{r}
+df_clean$Segmento_teg <- factor(df_clean$Cluster_Teigen, 
+                            levels = c("3","6","5" ,"1", "4", "2"), 
+                            labels = c("Premium", 
+                                       "High Potential",
+                                       "Wine Lovers only",
+                                       "Wine and meat",
+                                       "Value Seekers", 
+                                       "Budget/Low Income"))
+
+
+table(df_clean$Segmento_teg)
+```
+
+
+```{r}
+prob_mat <- mod_teigen$fuzzy
+
+uncertainty_vec <- 1 - apply(prob_mat, 1, max)
+df_clean$Uncertainty_teg <- uncertainty_vec
+df_clean$Cluster_Teigen <- cluster_teigen
+```
+
+
+```{r}
+uncertainty_summary <- df_clean %>%
+  group_by(Cluster_Teigen) %>%
+  summarise(
+    Count = n(),
+    Min_Unc = min(Uncertainty_teg),
+    Mean_Unc = mean(Uncertainty_teg),
+    Median_Unc = median(Uncertainty_teg),
+    Max_Unc = max(Uncertainty_teg),
+    SD_Unc = sd(Uncertainty_teg) 
+  ) %>%
+  arrange(desc(Mean_Unc))
+
+print(uncertainty_summary)
+```
+
+```{r}
+#vengono evidenziati solo i punti ad alta incertezza
+threshold <- 0.2
+uncertain_points <- df_plot_teigen[df_clean$Uncertainty > threshold, ]
+
+ggplot(df_plot_teigen, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(data = df_plot_teigen, color = "grey90", alpha = 0.5, size = 1) +
+  geom_point(data = uncertain_points, aes(color = Cluster), size = 2, alpha = 0.8) +
+  stat_ellipse(geom = "polygon", alpha = 0.1, level = 0.95) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Uncertain Cases",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal()
+```
+
+With this model, there is less uncertainty in associating observations with clusters.
+
+```{r}
+uncertainty <- 1 - apply(mod_teigen$fuzzy, 1, max)
+
+df_plot_unc_teigen <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  Cluster = factor(apply(mod_teigen$fuzzy, 1, which.max)),
+  Uncertainty = uncertainty
+)
+
+df_plot_unc_teigen <- df_plot_unc_teigen[order(df_plot_unc_teigen$Uncertainty), ]
+
+ggplot(df_plot_unc_teigen, aes(x = PC1, y = PC2, color = Uncertainty)) +
+  geom_point(size = 2, alpha = 0.8) +
+  stat_ellipse(aes(group = Cluster), color = "gray40", alpha = 0.3, type = "norm") +
+  scale_color_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  labs(
+    title = "Uncertainty Classification",
+    subtitle = "Blue = Confident classification | Red = High uncertainty (Overlap zones)",
+    x = "PC1",
+    y = "PC2",
+    color = "Uncertainty"
+  )
+```
+
+## Trasformazione Box Cox
+Finally, we applied Box Cox transformations to the highly skewed variables in order to apply k-means (despite knowing that this would not yield great results, given the nature of the data).
+As expected, it does not discriminate the data well, identifying two large clusters.
+
+```{r}
+vars_to_cluster <- grep("mnt_", names(df_clean), value = TRUE)
+data_cluster <- df_clean[, vars_to_cluster]
+
+#Trasformazione Box Cox
+apply_boxcox <- function(x) {
+  
+  if(min(x) <= 0) {
+    x <- x + 1 
+  }
+  
+  # Calcola il lambda ottimale
+  bc_obj <- BoxCoxTrans(x)
+  
+  # Applica la trasformazione
+  x_trans <- predict(bc_obj, x)
+  return(x_trans)
+}
+
+
+data_transformed <- data_cluster %>%
+  mutate(across(everything(), apply_boxcox))
+
+
+data_scaled <- scale(data_transformed)
+
+fviz_nbclust(data_scaled, kmeans, method = "silhouette") +
+  ggtitle("Optimal K")
+```
+
+
+```{r}
+set.seed(1926)
+k_final <- 2
+km_res <- kmeans(data_scaled, centers = k_final, nstart = 25)
+
+
+df_clean$Cluster_Box <- as.factor(km_res$cluster)
+```
+
+
+```{r}
+#visualizzazione PCA
+fviz_cluster(km_res, data = data_scaled,
+             palette = "jco", 
+             ggtheme = theme_minimal(),
+             main = "Clustering after Box-Cox Transformation")
+```
+
+
+```{r}
+df_clean %>%
+  group_by(Cluster_Box) %>%
+  summarise(across(all_of(vars_to_cluster), mean)) %>%
+  print()
+```
+
+## Comparison between models
+
+The model that uses generalized hyperbolic distribution tends to perform better in terms of ICL and BIC. 
+BOX-COX transformations were tested purely out of curiosity. 
+Given the nature of the data, outliers were cut, determining them using the interquartile range, but the results did not show any significant improvement. In particular, for the model that uses generalized hyperbolic distributions, the evaluation metrics improved by a few points, while the Teigen model lost much of its power and greatly increased its uncertainty in the allocation of observations.
